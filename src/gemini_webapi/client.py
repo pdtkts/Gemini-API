@@ -8,7 +8,7 @@ import orjson as json
 from httpx import AsyncClient, ReadTimeout, Response
 
 from .components import GemMixin
-from .constants import Endpoint, ErrorCode, Headers, Model
+from .constants import Endpoint, ErrorCode, Headers, ImageMode, Model
 from .exceptions import (
     APIError,
     AuthError,
@@ -242,6 +242,7 @@ class GeminiClient(GemMixin):
         model: Model | str | dict = Model.UNSPECIFIED,
         gem: Gem | str | None = None,
         chat: Optional["ChatSession"] = None,
+        image_mode: ImageMode | str = ImageMode.PRO,
         **kwargs,
     ) -> ModelOutput:
         """
@@ -262,6 +263,9 @@ class GeminiClient(GemMixin):
             Pass either a `gemini_webapi.types.Gem` object or a gem id string.
         chat: `ChatSession`, optional
             Chat data to retrieve conversation history. If None, will automatically generate a new chat id when sending post request.
+        image_mode: `ImageMode`, optional
+            Image generation mode. ImageMode.PRO for high quality, ImageMode.FAST for faster generation.
+            Defaults to ImageMode.PRO.
         kwargs: `dict`, optional
             Additional arguments which will be passed to the post request.
             Refer to `httpx.AsyncClient.request` for more information.
@@ -302,39 +306,75 @@ class GeminiClient(GemMixin):
         else:
             gem_id = gem
 
+        # Handle image_mode parameter
+        if isinstance(image_mode, str):
+            try:
+                image_mode = ImageMode(image_mode.lower())
+            except ValueError:
+                raise ValueError(
+                    f"Invalid image_mode: '{image_mode}'. Must be one of: {', '.join([m.value for m in ImageMode])}"
+                )
+        elif not isinstance(image_mode, ImageMode):
+            raise TypeError(
+                f"'image_mode' must be a `gemini_webapi.constants.ImageMode` instance or string; "
+                f"got `{type(image_mode).__name__}`"
+            )
+
         if self.auto_close:
             await self.reset_close_task()
+
+        # Build base payload
+        base_payload = [
+            files
+            and [
+                prompt,
+                0,
+                None,
+                [
+                    [
+                        [await upload_file(file, self.proxy)],
+                        parse_file_name(file),
+                    ]
+                    for file in files
+                ],
+            ]
+            or [prompt],
+            None,
+            chat and chat.metadata,
+        ]
+
+        inner_payload = base_payload
+        if gem_id:
+            inner_payload = inner_payload + [None] * 16 + [gem_id]
+
+        # Apply Pro mode payload parameters (Nano Banana Pro model)
+        if image_mode == ImageMode.PRO:
+            # Extend payload to include Pro mode markers
+            current_len = len(inner_payload)
+            if current_len < 50:
+                inner_payload = inner_payload + [None] * (17 - current_len)
+                inner_payload.append([[1]])  # idx 17: Pro quality marker
+                inner_payload = inner_payload + [None] * 31  # idx 18-48
+                inner_payload.append(14)  # idx 49: Pro mode flag
+
+        # Build request headers
+        request_headers = dict(model.model_header)
+        if image_mode == ImageMode.PRO:
+            # Pro mode header extension for Nano Banana Pro
+            request_headers["x-goog-ext-525001261-jspb"] = (
+                '[1,null,null,null,"9d8ca3786ebdfbea",null,null,0,[4],null,null,2]'
+            )
 
         try:
             response = await self.client.post(
                 Endpoint.GENERATE.value,
-                headers=model.model_header,
+                headers=request_headers,
                 data={
                     "at": self.access_token,
                     "f.req": json.dumps(
                         [
                             None,
-                            json.dumps(
-                                [
-                                    files
-                                    and [
-                                        prompt,
-                                        0,
-                                        None,
-                                        [
-                                            [
-                                                [await upload_file(file, self.proxy)],
-                                                parse_file_name(file),
-                                            ]
-                                            for file in files
-                                        ],
-                                    ]
-                                    or [prompt],
-                                    None,
-                                    chat and chat.metadata,
-                                ]
-                                + (gem_id and [None] * 16 + [gem_id] or [])
-                            ).decode(),
+                            json.dumps(inner_payload).decode(),
                         ]
                     ).decode(),
                 },
@@ -358,6 +398,11 @@ class GeminiClient(GemMixin):
 
             try:
                 response_json = extract_json_from_response(response.text)
+                logger.debug(f"response_json parts count: {len(response_json)}")
+
+                # Find the body with candidates
+                body = []
+                body_index = 0
 
                 for part_index, part in enumerate(response_json):
                     try:
@@ -366,12 +411,16 @@ class GeminiClient(GemMixin):
                             continue
 
                         part_json = json.loads(part_body)
-                        if get_nested_value(part_json, [4]):
+                        # Check for body containing candidates at [4]
+                        candidates_at_4 = get_nested_value(part_json, [4])
+                        if candidates_at_4:
                             body_index, body = part_index, part_json
+                            logger.debug(f"Found body at part {part_index}, body[4] has {len(candidates_at_4)} candidates")
                             break
                     except json.JSONDecodeError:
                         continue
 
+                logger.debug(f"After body loop: body found={bool(body)}")
                 if not body:
                     raise Exception
             except Exception:
@@ -409,10 +458,13 @@ class GeminiClient(GemMixin):
                     )
 
             try:
+                # Standard format processing - works for both regular and Nano Banana Pro
                 candidate_list: list[Any] = get_nested_value(body, [4], [])
+                logger.debug(f"candidate_list count: {len(candidate_list)}")
                 output_candidates: list[Candidate] = []
 
                 for candidate_index, candidate in enumerate(candidate_list):
+                    logger.debug(f"Candidate {candidate_index}: type={type(candidate)}, first_item={candidate[0] if isinstance(candidate, list) and candidate else 'N/A'}")
                     rcid = get_nested_value(candidate, [0])
                     if not rcid:
                         continue  # Skip candidate if it has no rcid
@@ -425,6 +477,10 @@ class GeminiClient(GemMixin):
                         text = get_nested_value(candidate, [22, 0]) or text
 
                     thoughts = get_nested_value(candidate, [37, 0, 0])
+
+                    # Debug candidate structure for image detection
+                    candidate_12 = get_nested_value(candidate, [12])
+                    logger.debug(f"Candidate[12] type={type(candidate_12)}, value={str(candidate_12)[:200] if candidate_12 else 'None'}")
 
                     # Web images
                     web_images = []
@@ -444,7 +500,17 @@ class GeminiClient(GemMixin):
 
                     # Generated images
                     generated_images = []
-                    if get_nested_value(candidate, [12, 7, 0]):
+                    # Check multiple indicators for generated images:
+                    # 1. Original path [12, 7, 0] for prompt-only
+                    # 2. Dict format [12][0]["8"] for Nano Banana Pro with files
+                    # 3. Text contains image placeholder URL
+                    path_12_7_0 = get_nested_value(candidate, [12, 7, 0])
+                    # Check if candidate[12][0] is a dict with "8" key (Nano Banana Pro format)
+                    candidate_12_0 = get_nested_value(candidate, [12, 0])
+                    path_12_0_dict_8 = candidate_12_0.get("8") if isinstance(candidate_12_0, dict) else None
+                    has_placeholder = text and "googleusercontent.com/image_generation_content" in text
+                    has_generated_images = path_12_7_0 or path_12_0_dict_8 or has_placeholder
+                    if has_generated_images:
                         img_body = None
                         for img_part_index, part in enumerate(response_json):
                             if img_part_index < body_index:
@@ -455,63 +521,105 @@ class GeminiClient(GemMixin):
                                     continue
 
                                 img_part_json = json.loads(img_part_body)
-                                if get_nested_value(
-                                    img_part_json, [4, candidate_index, 12, 7, 0]
-                                ):
+                                # Check for generated images in various paths
+                                cand_12_0 = get_nested_value(img_part_json, [4, candidate_index, 12, 0])
+                                has_orig = get_nested_value(img_part_json, [4, candidate_index, 12, 7, 0])
+                                has_dict_8 = isinstance(cand_12_0, dict) and "8" in cand_12_0
+                                if has_orig or has_dict_8:
                                     img_body = img_part_json
                                     break
                             except json.JSONDecodeError:
                                 continue
 
+                        # If img_body not found, use candidate directly
                         if not img_body:
-                            raise ImageGenerationError(
-                                "Failed to parse generated images. Please update gemini_webapi to the latest version. "
-                                "If the error persists and is caused by the package, please report it on GitHub."
+                            img_candidate = candidate
+                        else:
+                            img_candidate = get_nested_value(
+                                img_body, [4, candidate_index], []
                             )
-
-                        img_candidate = get_nested_value(
-                            img_body, [4, candidate_index], []
-                        )
 
                         if finished_text := get_nested_value(
                             img_candidate, [1, 0]
-                        ):  # Only overwrite if new text is returned after image generation
+                        ):
                             text = re.sub(
                                 r"http://googleusercontent\.com/image_generation_content/\d+",
                                 "",
                                 finished_text,
                             ).rstrip()
 
-                        for img_index, gen_img_data in enumerate(
-                            get_nested_value(img_candidate, [12, 7, 0], [])
-                        ):
-                            url = get_nested_value(gen_img_data, [0, 3, 3])
-                            if not url:
-                                continue
+                        # Get generated images - try original path first
+                        gen_img_list = get_nested_value(img_candidate, [12, 7, 0], [])
+                        use_dict_format = False
 
-                            img_num = get_nested_value(gen_img_data, [3, 6])
-                            title = (
-                                f"[Generated Image {img_num}]"
-                                if img_num
-                                else "[Generated Image]"
-                            )
+                        if not gen_img_list:
+                            # Try dict format: candidate[12][0]["8"]
+                            img_cand_12_0 = get_nested_value(img_candidate, [12, 0])
+                            if isinstance(img_cand_12_0, dict) and "8" in img_cand_12_0:
+                                gen_img_list = img_cand_12_0["8"]
+                                use_dict_format = True
 
-                            alt_list = get_nested_value(gen_img_data, [3, 5], [])
-                            alt = (
-                                get_nested_value(alt_list, [img_index])
-                                or get_nested_value(alt_list, [0])
-                                or ""
-                            )
+                        if use_dict_format:
+                            # Dict format: gen_img_list structure is deeply nested
+                            # Images can be at various positions within nested lists
+                            # Structure: gen_img_list[0][0][0] has items, some are image info
+                            for group_idx, img_group in enumerate(gen_img_list):
+                                if not isinstance(img_group, list):
+                                    continue
+                                for sub_idx, sub_list in enumerate(img_group):
+                                    if not isinstance(sub_list, list):
+                                        continue
+                                    for elem_idx, elem in enumerate(sub_list):
+                                        if not isinstance(elem, list):
+                                            continue
+                                        # Scan all items in elem for image info
+                                        # Image info format: [None, 1, 'filename', 'url', ...]
+                                        for item_idx, item in enumerate(elem):
+                                            if not isinstance(item, list) or len(item) < 4:
+                                                continue
+                                            # Check if item is image info (item[3] is URL string)
+                                            if isinstance(item[3], str) and item[3].startswith("http"):
+                                                url = item[3]
+                                                filename = item[2] if len(item) > 2 else ""
+                                                generated_images.append(
+                                                    GeneratedImage(
+                                                        url=url,
+                                                        title="[Generated Image]",
+                                                        alt=filename,
+                                                        proxy=self.proxy,
+                                                        cookies=self.cookies,
+                                                    )
+                                                )
+                        else:
+                            # Original format
+                            for img_index, gen_img_data in enumerate(gen_img_list):
+                                url = get_nested_value(gen_img_data, [0, 3, 3])
+                                if not url:
+                                    continue
 
-                            generated_images.append(
-                                GeneratedImage(
-                                    url=url,
-                                    title=title,
-                                    alt=alt,
-                                    proxy=self.proxy,
-                                    cookies=self.cookies,
+                                img_num = get_nested_value(gen_img_data, [3, 6])
+                                title = (
+                                    f"[Generated Image {img_num}]"
+                                    if img_num
+                                    else "[Generated Image]"
                                 )
-                            )
+
+                                alt_list = get_nested_value(gen_img_data, [3, 5], [])
+                                alt = (
+                                    get_nested_value(alt_list, [img_index])
+                                    or get_nested_value(alt_list, [0])
+                                    or ""
+                                )
+
+                                generated_images.append(
+                                    GeneratedImage(
+                                        url=url,
+                                        title=title,
+                                        alt=alt,
+                                        proxy=self.proxy,
+                                        cookies=self.cookies,
+                                    )
+                                )
 
                     output_candidates.append(
                         Candidate(
