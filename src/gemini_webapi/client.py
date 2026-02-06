@@ -563,6 +563,8 @@ class GeminiClient(GemMixin):
                             # Dict format: gen_img_list structure is deeply nested
                             # Images can be at various positions within nested lists
                             # Structure: gen_img_list[0][0][0] has items, some are image info
+                            # NOTE: Each elem may contain multiple images (first=watermarked, last=clean)
+                            # We only want the LAST image in each elem (the clean one without watermark)
                             for group_idx, img_group in enumerate(gen_img_list):
                                 if not isinstance(img_group, list):
                                     continue
@@ -572,8 +574,9 @@ class GeminiClient(GemMixin):
                                     for elem_idx, elem in enumerate(sub_list):
                                         if not isinstance(elem, list):
                                             continue
-                                        # Scan all items in elem for image info
+                                        # Collect all image items in this elem
                                         # Image info format: [None, 1, 'filename', 'url', ...]
+                                        elem_images = []
                                         for item_idx, item in enumerate(elem):
                                             if not isinstance(item, list) or len(item) < 4:
                                                 continue
@@ -581,21 +584,47 @@ class GeminiClient(GemMixin):
                                             if isinstance(item[3], str) and item[3].startswith("http"):
                                                 url = item[3]
                                                 filename = item[2] if len(item) > 2 else ""
-                                                generated_images.append(
-                                                    GeneratedImage(
-                                                        url=url,
-                                                        title="[Generated Image]",
-                                                        alt=filename,
-                                                        proxy=self.proxy,
-                                                        cookies=self.cookies,
-                                                    )
+                                                elem_images.append((url, filename))
+                                        # Only take the LAST image (non-watermarked version)
+                                        if elem_images:
+                                            url, filename = elem_images[-1]
+                                            generated_images.append(
+                                                GeneratedImage(
+                                                    url=url,
+                                                    title="[Generated Image]",
+                                                    alt=filename,
+                                                    proxy=self.proxy,
+                                                    cookies=self.cookies,
                                                 )
+                                            )
                         else:
                             # Original format
+                            # Structure: gen_img_data[0] = [None, None, None, [img1], None, None, [img2], ...]
+                            # First image is watermarked, last image is clean - take the last one
                             for img_index, gen_img_data in enumerate(gen_img_list):
-                                url = get_nested_value(gen_img_data, [0, 3, 3])
-                                if not url:
+                                inner_list = get_nested_value(gen_img_data, [0], [])
+                                if not isinstance(inner_list, list):
                                     continue
+
+                                # Scan for all image info arrays and take the last one
+                                # Image info format: [None, 1, 'filename', 'url', ...]
+                                found_images = []
+                                for item in inner_list:
+                                    if (isinstance(item, list) and len(item) >= 4
+                                        and isinstance(item[3], str) and item[3].startswith("http")):
+                                        found_images.append(item)
+
+                                if not found_images:
+                                    # Fallback to original path
+                                    url = get_nested_value(gen_img_data, [0, 3, 3])
+                                    if not url:
+                                        continue
+                                    filename = get_nested_value(gen_img_data, [0, 3, 2], "")
+                                else:
+                                    # Take the LAST image (clean version without watermark)
+                                    last_img = found_images[-1]
+                                    url = last_img[3]
+                                    filename = last_img[2] if len(last_img) > 2 else ""
 
                                 img_num = get_nested_value(gen_img_data, [3, 6])
                                 title = (
@@ -608,6 +637,7 @@ class GeminiClient(GemMixin):
                                 alt = (
                                     get_nested_value(alt_list, [img_index])
                                     or get_nested_value(alt_list, [0])
+                                    or filename
                                     or ""
                                 )
 
