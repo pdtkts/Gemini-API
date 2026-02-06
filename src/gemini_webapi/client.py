@@ -8,7 +8,7 @@ import orjson as json
 from httpx import AsyncClient, ReadTimeout, Response
 
 from .components import GemMixin
-from .constants import Endpoint, ErrorCode, Headers, ImageMode, Model
+from .constants import Endpoint, ErrorCode, GRPC, Headers, ImageMode, Model
 from .exceptions import (
     APIError,
     AuthError,
@@ -700,6 +700,25 @@ class GeminiClient(GemMixin):
         """
 
         return ChatSession(geminiclient=self, **kwargs)
+
+    async def delete_chat(self, cid: str) -> None:
+        """
+        Delete a specific conversation by chat id.
+
+        Parameters
+        ----------
+        cid: `str`
+            The ID of the chat requiring deletion (e.g. "c_...").
+        """
+
+        await self._batch_execute(
+            [
+                RPCData(
+                    rpcid=GRPC.DELETE_CHAT,
+                    payload=json.dumps([cid]),
+                ),
+            ]
+        )
 
     async def _batch_execute(self, payloads: list[RPCData], **kwargs) -> Response:
         """
