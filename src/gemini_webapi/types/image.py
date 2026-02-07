@@ -9,6 +9,19 @@ from pydantic import BaseModel, field_validator
 from ..utils import logger
 
 
+def _cookies_to_dict(cookies: dict | Cookies | None) -> dict:
+    """Convert cookies to plain dict to avoid domain-matching issues on CDN URLs."""
+    if cookies is None:
+        return {}
+    if isinstance(cookies, dict):
+        return cookies
+    # Extract all cookie values from Cookies jar, ignoring domains
+    result = {}
+    for cookie in cookies.jar:
+        result[cookie.name] = cookie.value
+    return result
+
+
 class Image(BaseModel):
     """
     A single image object returned from Gemini.
@@ -81,8 +94,17 @@ class Image(BaseModel):
             if skip_invalid_filename:
                 return None
 
+        # Convert cookies to dict to avoid domain-matching issues on cross-domain CDN URLs
+        cookies_dict = _cookies_to_dict(cookies)
+
         async with AsyncClient(
-            http2=True, follow_redirects=True, cookies=cookies, proxy=self.proxy
+            http2=True,
+            follow_redirects=True,
+            cookies=cookies_dict,
+            proxy=self.proxy,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+            },
         ) as client:
             response = await client.get(self.url)
             if response.status_code == 200:
