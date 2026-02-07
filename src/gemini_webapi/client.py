@@ -77,6 +77,7 @@ class GeminiClient(GemMixin):
         "close_task",
         "auto_refresh",
         "refresh_interval",
+        "verbose",
         "_gems",  # From GemMixin
         "kwargs",
     ]
@@ -100,6 +101,7 @@ class GeminiClient(GemMixin):
         self.close_task: Task | None = None
         self.auto_refresh: bool = True
         self.refresh_interval: float = 540
+        self.verbose: bool = True
         self.kwargs = kwargs
 
         if secure_1psid:
@@ -159,6 +161,7 @@ class GeminiClient(GemMixin):
             if self.auto_close:
                 await self.reset_close_task()
 
+            self.verbose = verbose
             self.auto_refresh = auto_refresh
             self.refresh_interval = refresh_interval
             if task := rotate_tasks.get(self.cookies["__Secure-1PSID"]):
