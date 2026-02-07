@@ -137,7 +137,7 @@ class GeminiClient(GemMixin):
         """
 
         try:
-            access_token, valid_cookies = await get_access_token(
+            access_token, _cfb2h, _fdrfje, valid_cookies = await get_access_token(
                 base_cookies=self.cookies, proxy=self.proxy, verbose=verbose
             )
 
