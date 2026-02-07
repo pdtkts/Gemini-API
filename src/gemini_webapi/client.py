@@ -215,7 +215,7 @@ class GeminiClient(GemMixin):
         while True:
             new_1psidts: str | None = None
             try:
-                new_1psidts = await rotate_1psidts(self.cookies, self.proxy)
+                new_1psidts, _ = await rotate_1psidts(self.cookies, self.proxy)
             except AuthError:
                 if task := rotate_tasks.get(self.cookies.get("__Secure-1PSID", "")):
                     task.cancel()
